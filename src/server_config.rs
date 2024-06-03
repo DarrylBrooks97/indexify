@@ -1,6 +1,5 @@
 use std::{
-    fmt,
-    fs,
+    fmt, fs,
     net::{AddrParseError, IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -90,6 +89,20 @@ impl Default for QdrantConfig {
     fn default() -> Self {
         Self {
             addr: "http://127.0.0.1:6334".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurboClientConfig {
+    pub api_key: String,
+}
+
+impl Default for TurboClientConfig {
+    fn default() -> Self {
+        Self {
+            api_key: "api-key".into(),
         }
     }
 }
