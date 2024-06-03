@@ -12,6 +12,7 @@ pub mod lancedb;
 //pub mod open_search;
 pub mod pg_vector;
 pub mod qdrant;
+pub mod turbopuffer;
 
 use qdrant::QdrantDb;
 
