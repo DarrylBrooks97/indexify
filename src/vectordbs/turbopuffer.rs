@@ -2,40 +2,55 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use indexify_internal_api::{ContentMetadata, Embedding};
-use turbopuffer_client::{Client, NamespacedClient};
+use indexify_internal_api::ContentMetadata;
+use turbopuffer_client::Client;
 
-use serde::{json, Deserialize, Serialize};
+
+use serde::{Serialize, Deserialize};
+use serde_json::{json, Value};
 
 use super::{CreateIndexParams, VectorDb};
 use crate::{
     server_config::TurboClientConfig,
-    vectordbs::{FilterOperator, IndexDistance, SearchResult, VectorChunk},
+    vectordbs::{SearchResult, VectorChunk},
 };
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexifyPayload {
+    pub content_metadata: ContentMetadata,
+    pub root_content_metadata: Option<ContentMetadata>,
+}
+
+impl IndexifyPayload {
+    pub fn new(
+        content_metadata: ContentMetadata,
+        root_content_metadata: Option<ContentMetadata>,
+    ) -> Self {
+        Self {
+            content_metadata,
+            root_content_metadata,
+        }
+    }
+}
 
 fn hex_to_u64(hex: &str) -> Result<u64, std::num::ParseIntError> {
     u64::from_str_radix(hex, 16)
 }
 
+fn extract_metadata_from_attributes(
+    attributes: HashMap<String, Value>
+) -> Result<(HashMap<String, serde_json::Value>, IndexifyPayload)> {
+    
+    let value = serde_json::to_value(attributes).map_err(|e| anyhow!("{}", e.to_string()))?;
+    let payload: HashMap<String, Value>= serde_json::from_value(value.clone()).map_err(|e| anyhow!("{}", e.to_string()))?;
+    let indexify_payload: IndexifyPayload =  serde_json::from_value(value.clone()).map_err(|e| anyhow!("{}", e.to_string()))?;
+
+    Ok((payload, indexify_payload))
+}
+
 #[derive(Debug)]
 pub struct TurboPuffer {
     turbo_config: TurboClientConfig,
-}
-
-// TODO: Figure out how to convert IndexifyPayload to TurboPufferPayload
-fn extract_metadata_from_attributes(
-    attributes: HashMap<String, Value>,
-) -> Result<(HashMap<String, serde_json::Value>, IndexifyPayload)> {
-    let attributes: serde_json::Value =
-        serde_json::to_value(attributes).map_err(|e| anyhow!("{}", e.to_string()))?;
-    let mut attributes: HashMap<String, serde_json::Value> =
-        serde_json::from_value(attributes.clone()).map_err(|e| anyhow!(e.to_string()))?;
-    let indexify_payload = attributes
-        .remove("indexify_payload")
-        .ok_or(anyhow!("no indexify system payload found"))?;
-    let indexify_payload: IndexifyPayload =
-        serde_json::from_value(indexify_payload.clone()).map_err(|e| anyhow!(e));
-    Ok((attributes, indexify_payload))
 }
 
 impl TurboPuffer {
@@ -46,8 +61,7 @@ impl TurboPuffer {
     }
 
     pub fn create_client(&self) -> Result<Client> {
-        let client_config = TurboClientConfig::new(&self.turbo_config.api_key);
-        let client = Client::new(Some(client_config));
+        let client = Client::new(&self.turbo_config.api_key);
 
         Ok(client)
     }
@@ -60,29 +74,36 @@ impl VectorDb for TurboPuffer {
     }
 
     #[tracing::instrument]
-    async fn create_index(&self, index: CreateIndexParams) -> Result<()> {
+    async fn create_index(&self, _index: CreateIndexParams) -> Result<()> {
         Ok(())
     }
 
     #[tracing::instrument]
     async fn add_embedding(&self, index: &str, chunks: Vec<VectorChunk>) -> Result<()> {
-        let distance = "".into();
 
-        let body = json!({
-          "ids": chunks.iter().map(|c| c.content_id.clone()).collect::<Vec<String>>(),
-          "vectors": chunks.iter().map(|c| c.embedding.clone()).collect::<Vec<Embedding>(),
-          "attributes": chunks.iter().map(|c| c.labels.clone()).collect::<Vec<ContentMetadata>(),
-          "distance": "cosine_distance"
-        });
+        let payload: Vec<serde_json::Value> = chunks
+            .iter()
+            .map(|chunk| {
+                let ids = vec![chunk.content_id.clone()];
+
+                json!({
+                    "ids": ids,
+                    "vectors": chunk.embedding,
+                    "attributes": &chunk.content_metadata,
+                })
+            })
+            .collect();
 
         let client = self.create_client()?;
 
         let ns = client.namespace(index);
 
-        let res = ns
-            .upsert(body)
-            .await
-            .map_err(|e| anyhow!("Failed to upsert: {}", e.to_string()))?;
+        for payload in payload.iter() {
+             ns
+                .upsert(payload)
+                .await
+                .map_err(|e| anyhow!("Failed to upsert: {}", e.to_string()));
+        }
 
         Ok(())
     }
@@ -98,28 +119,30 @@ impl VectorDb for TurboPuffer {
         let ns = client.namespace(index);
 
         let body = json!({
-            "ids": content_ids
+            "ids": content_ids,
             "include_vectors": true,
         });
 
         let res = ns
-            .query(body)
+            .query(&body)
             .await
             .map_err(|e| anyhow!("Failed to read index: {}", e.to_string()))?;
 
         let mut chunks: Vec<VectorChunk> = Vec::new();
 
         for doc in res.vectors {
-            let (metadata, indexify_payload) = extract_metadata_from_attributes(doc.attributes)
-                .map_err(|e| anyhow!("Unable to get points: {}", e.to_string()));
-            let embedding = doc.vector;
+            let content_id = doc.id.to_string();
+            let embedding = doc.vector.unwrap();
+            let metadata = doc.attributes.unwrap();
+
+            let (payload, indexify_payload) = extract_metadata_from_attributes(metadata)?;
 
             let chunk = VectorChunk {
-                metadata,
                 embedding,
-                content_id: indexify_payload.content_id,
-                root_content_metadata: indexify_payload.root_content_metadata,
+                content_id,
+                metadata: payload,
                 content_metadata: indexify_payload.content_metadata,
+                root_content_metadata: indexify_payload.root_content_metadata,
             };
 
             chunks.push(chunk);
@@ -132,8 +155,8 @@ impl VectorDb for TurboPuffer {
     async fn update_metadata(
         &self,
         index: &str,
-        content_id: String,
-        metadata: HashMap<String, serde_json::Value>,
+        _content_id: String,
+        _metadata: HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         todo!()
     }
@@ -143,7 +166,7 @@ impl VectorDb for TurboPuffer {
         index: String,
         query_embedding: Vec<f32>,
         k: u64,
-        filters: Vec<Filter>,
+        filters: Vec<super::Filter>,
     ) -> Result<Vec<SearchResult>> {
         if !filters.is_empty() {
             // TOOD: Create filter struct
@@ -158,8 +181,8 @@ impl VectorDb for TurboPuffer {
             "top_k": k,
             "vector": query_embedding,
             "distance_metric": "cosine_distance",
-            "filter": filter,
-            "include_vectors": false
+            // "filters": filters,
+            "include_vectors": false,
             "include_attributes": true,
         });
 
@@ -171,13 +194,12 @@ impl VectorDb for TurboPuffer {
         let mut documents: Vec<SearchResult> = Vec::new();
 
         for doc in res.vectors {
-            let (metadata, indexify_payload) = extract_metadata_from_attributes(doc.attributes)?;
-            // Only f32
-            let embedding = doc.vector.unwrap();
+            let attributes = doc.attributes.unwrap();
+            let ( payload, indexify_payload ) = extract_metadata_from_attributes(attributes)?;
 
             documents.push(SearchResult {
-                metadata,
-                content_id: indexify_payload.content_id,
+                content_id: doc.id.to_string(),
+                metadata: payload,
                 confidence_score: doc.dist,
                 content_metadata: indexify_payload.content_metadata,
                 root_content_metadata: indexify_payload.root_content_metadata,
@@ -190,7 +212,7 @@ impl VectorDb for TurboPuffer {
     async fn drop_index(&self, index: &str) -> Result<()> {
         let client = self.create_client()?;
 
-        let res = client
+        client
             .namespace(&index)
             .delete()
             .await
@@ -202,4 +224,5 @@ impl VectorDb for TurboPuffer {
     async fn num_vectors(&self, index: &str) -> Result<u64> {
         todo!()
     }
+
 }
