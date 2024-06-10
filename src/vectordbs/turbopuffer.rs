@@ -226,3 +226,39 @@ impl VectorDb for TurboPuffer {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        server_config::TurboClientConfig,
+        vectordbs::{
+            tests::{basic_search, store_metadata},
+            VectorDBTS,
+        },
+    };
+
+    use super::TurboPuffer;
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_search_basic(){
+        let turbo_client: VectorDBTS= Arc::new(TurboPuffer::new (TurboClientConfig { api_key: "test".into() }));
+
+
+        basic_search(turbo_client, "test").await;
+    }
+
+    #[tokio::test]
+    async fn test_store_metadata() {
+        let turbo_client: VectorDBTS = Arc::new(TurboPuffer::new(TurboClientConfig{ 
+            api_key: "test".into()
+        }));
+
+        turbo_client.drop_index("test").await.unwrap();
+
+        store_metadata(turbo_client, "test").await;
+    }
+
+}
